@@ -1,0 +1,295 @@
+/**
+ * ============================================================
+ * ORDER MANAGEMENT PRO - BACKEND
+ * Refactored for Stability & Performance
+ * ============================================================
+ */
+
+const CONFIG = {
+  SHEET_ORDERS: "Orders",
+  SHEET_PRODUCTS: "Products",
+  SHEET_COURIERS: "Courier"
+};
+
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('Index')
+      .setTitle('Order Management Pro')
+      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+      .addMetaTag('viewport', 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0');
+}
+
+// --- Standard Response Helper ---
+function createResponse(success, data = null, message = "") {
+  return { success, data, message };
+}
+
+// --- API: Get Master Data ---
+function getInitData() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const getList = (sheetName, col) => {
+      const sheet = ss.getSheetByName(sheetName);
+      if (!sheet) return [];
+      const lastRow = sheet.getLastRow();
+      if (lastRow < 2) return [];
+      return sheet.getRange(`${col}2:${col}${lastRow}`).getValues()
+        .flat()
+        .filter(item => item && item.toString().trim() !== "");
+    };
+    return createResponse(true, {
+      products: getList(CONFIG.SHEET_PRODUCTS, "B"),
+      couriers: getList(CONFIG.SHEET_COURIERS, "A")
+    });
+  } catch (e) {
+    return createResponse(false, null, e.message);
+  }
+}
+
+// --- Utility: Formats ---
+function formatDateThai(dateStr) {
+  if (!dateStr) return "";
+  const parts = dateStr.split('-');
+  if (parts.length === 3) return `'${parts[2]}/${parts[1]}/${parts[0]}`;
+  return "'" + dateStr;
+}
+
+function formatPhoneForSheet(p) {
+  let str = (p || "").toString().trim().replace(/-|\s/g, "");
+  if (str === "") return "";
+  if (str.startsWith("66")) str = "0" + str.substring(2);
+  return "'" + str; 
+}
+
+// --- Utility: Clean Thai Text Artifacts ---
+function cleanThaiText(text) {
+  if (!text || typeof text !== 'string') return text;
+
+  // 1. Normalize Unicode (NFKC) - fixes compatibility chars
+  let clean = text.normalize('NFKC');
+
+  // 2. Remove Zero-width spaces & control chars
+  clean = clean.replace(/[\u200B-\u200D\uFEFF]/g, '');
+
+  // 3. Fix "Sara Am" decomposition (Nikhahit + Sara Aa -> Sara Am)
+  // This handles the specific issue of "สระ ํา ให้เป็น ำ"
+  clean = clean.replace(/\u0E4D\u0E32/g, '\u0E33');
+
+  // 4. Fix Thai PUA (Private Use Area) artifacts often found in PDFs
+  clean = clean.replace(/[\uF700-\uF71F]/g, (c) => {
+      const code = c.charCodeAt(0);
+      if (code === 0xF70A) return '\u0E48'; // Mai Ek
+      if (code === 0xF70B) return '\u0E49'; // Mai Tho
+      if (code === 0xF70C) return '\u0E4A'; // Mai Tri
+      if (code === 0xF70D) return '\u0E4B'; // Mai Chattawa
+      if (code === 0xF70E) return '\u0E4C'; // Thanthakhat
+      return ''; 
+  });
+
+  return clean.trim();
+}
+
+// --- API: Save Data ---
+function saveData(data) {
+  return saveBatchData({ orders: [data] });
+}
+
+// --- API: Save Batch Data ---
+function saveBatchData(payload) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) return createResponse(false, null, "ระบบกำลังยุ่ง กรุณาลองใหม่");
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sheet = ss.getSheetByName(CONFIG.SHEET_ORDERS);
+    if (!sheet) {
+        sheet = ss.insertSheet(CONFIG.SHEET_ORDERS);
+        sheet.appendRow(["Date", "Order No", "Set", "Page", "Recipient", "Address", "Phone", "Product", "Qty", "Courier"]);
+    }
+    
+    const allRows = [];
+    payload.orders.forEach(data => {
+      const phone = formatPhoneForSheet(data.phone);
+      const dateStr = formatDateThai(data.date);
+      data.items.forEach(item => {
+        allRows.push([
+          dateStr, data.order_no.toString(), data.set_name, data.page_no,
+          data.recipient_name, data.address, phone, item.name, item.qty, data.courier
+        ]);
+      });
+    });
+
+    if (allRows.length > 0) {
+      sheet.getRange(sheet.getLastRow() + 1, 1, allRows.length, allRows[0].length).setValues(allRows);
+    }
+    return createResponse(true, null, `บันทึกสำเร็จ ${payload.orders.length} ออเดอร์`);
+  } catch (e) {
+    return createResponse(false, null, "Error: " + e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// --- API: Update Order ---
+function updateOrder(oldNo, newData) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return createResponse(false, null, "ระบบกำลังยุ่ง");
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(CONFIG.SHEET_ORDERS);
+    const dataRange = sheet.getDataRange();
+    const values = dataRange.getValues(); 
+    
+    const rowsToDelete = [];
+    for (let i = values.length - 1; i >= 1; i--) { 
+      if (values[i][1].toString() === oldNo.toString()) rowsToDelete.push(i + 1);
+    }
+
+    if (rowsToDelete.length === 0) return createResponse(false, null, "ไม่พบข้อมูลเดิม");
+
+    rowsToDelete.forEach(rowIndex => sheet.deleteRow(rowIndex));
+
+    const phone = formatPhoneForSheet(newData.phone);
+    const dateStr = formatDateThai(newData.date);
+    const newRows = newData.items.map(item => [
+      dateStr, newData.order_no.toString(), newData.set_name, newData.page_no,
+      newData.recipient_name, newData.address, phone, item.name, item.qty, newData.courier
+    ]);
+
+    const insertPos = rowsToDelete[rowsToDelete.length - 1]; 
+    if (newRows.length > 0) {
+      sheet.insertRowsBefore(insertPos, newRows.length);
+      sheet.getRange(insertPos, 1, newRows.length, newRows[0].length).setValues(newRows);
+    }
+    return createResponse(true, null, "แก้ไขข้อมูลเรียบร้อย");
+  } catch (e) {
+    return createResponse(false, null, "Error: " + e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// --- API: Delete Order ---
+function deleteOrder(no) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return createResponse(false, null, "ระบบยุ่ง");
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(CONFIG.SHEET_ORDERS);
+    const data = sheet.getDataRange().getValues();
+    let deletedCount = 0;
+    for (let i = data.length - 1; i >= 1; i--) {
+      if (data[i][1].toString() === no.toString()) { 
+        sheet.deleteRow(i + 1); deletedCount++;
+      }
+    }
+    if (deletedCount === 0) return createResponse(false, null, "ไม่พบข้อมูล");
+    return createResponse(true, null, `ลบข้อมูลเรียบร้อย (${deletedCount} รายการ)`);
+  } catch (e) {
+    return createResponse(false, null, "Error: " + e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// --- API: Get Orders Data ---
+function getOrderData() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(CONFIG.SHEET_ORDERS);
+    if (!sheet) return createResponse(true, []);
+    const rows = sheet.getDataRange().getDisplayValues(); 
+    if (rows.length <= 1) return createResponse(true, []);
+
+    const grouped = {};
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i];
+      if (r.length < 2) continue;
+      const id = r[1];
+      if (!id) continue;
+      if (!grouped[id]) {
+        grouped[id] = { date: r[0], no: id, set: r[2], pg: r[3], nm: r[4], ad: r[5], tel: r[6], items: [], cur: r[9] };
+      }
+      if (r[7]) grouped[id].items.push({ name: r[7], qty: r[8] });
+    }
+    return createResponse(true, Object.values(grouped).reverse());
+  } catch (e) {
+    return createResponse(false, [], e.message);
+  }
+}
+
+// --- API: Process PDF Text with Gemini (AI) ---
+function processWithAI(pdfPages, apiKey) {
+  if (!apiKey) return createResponse(false, null, "ไม่พบ API Key");
+  if (!pdfPages || pdfPages.length === 0) return createResponse(false, null, "ไม่มีข้อมูล PDF");
+
+  const combinedText = pdfPages.map(p => `--- PAGE ${p.pageIndex} ---\n${p.text}`).join("\n\n");
+
+  const prompt = `
+    Task: Extract shipping order details from Thai shipping labels.
+    
+    Instructions:
+    - Phone: If starts with 66, convert to 0. Example: 66912345678 -> 0912345678.
+    - Text: Fix Thai vowel issues, specifically merge ' ํา' to 'ำ'.
+    
+    Fields per Order:
+    1. "page_no": Integer.
+    2. "order_no": String.
+    3. "recipient_name": String.
+    4. "address": String.
+    5. "phone": String (Clean format 0xxxxxxxxx).
+    6. "items": ALWAYS return [{"name": "", "qty": 1}].
+
+    Return JSON Array only.
+    Raw Text:
+    ${combinedText}
+  `;
+
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+    const payload = { contents: [{ parts: [{ text: prompt }] }] };
+    
+    const options = {
+      'method': 'post',
+      'contentType': 'application/json',
+      'payload': JSON.stringify(payload),
+      'muteHttpExceptions': true
+    };
+
+    const response = UrlFetchApp.fetch(url, options);
+    const json = JSON.parse(response.getContentText());
+    
+    if (json.error) throw new Error(json.error.message);
+    if (!json.candidates || !json.candidates[0]) throw new Error("No AI response");
+
+    let rawResult = json.candidates[0].content.parts[0].text;
+    rawResult = rawResult.replace(/```json/g, '').replace(/```/g, '').trim();
+    
+    const jsonMatch = rawResult.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) throw new Error("Invalid JSON format");
+    
+    let parsedData = JSON.parse(jsonMatch[0]);
+
+    // Post-processing
+    parsedData = parsedData.map(d => {
+       // Clean Text
+       if(d.recipient_name) d.recipient_name = cleanThaiText(d.recipient_name);
+       if(d.address) d.address = cleanThaiText(d.address);
+       
+       // Clean Phone: Force 66 -> 0 replacement
+       if(d.phone) {
+           let p = d.phone.toString().replace(/\D/g, ''); // Remove non-digits
+           if (p.startsWith('66')) p = '0' + p.substring(2);
+           d.phone = p;
+       }
+
+       d.items = [{"name": "", "qty": 1}];
+       return d;
+    });
+
+    return createResponse(true, parsedData, "Success");
+
+  } catch (error) {
+    return createResponse(false, null, "AI Error: " + error.message);
+  }
+}
