@@ -1,0 +1,6 @@
+function triggerAuth() {
+  // บังคับให้ระบบเรียกใช้ UrlFetch เพื่อกระตุ้นหน้าต่างขอสิทธิ์
+  UrlFetchApp.fetch("https://www.google.com");
+  SpreadsheetApp.getActiveSpreadsheet();
+  console.log("Authorization Successful!");
+}
