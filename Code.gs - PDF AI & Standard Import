@@ -1,0 +1,453 @@
+/**
+ * ============================================================
+ * ORDER MANAGEMENT PRO - BACKEND
+ * Refactored for Stability & Performance
+ * ============================================================
+ */
+
+const CONFIG = {
+  SHEET_ORDERS: "Orders",
+  SHEET_PRODUCTS: "Products",
+  SHEET_COURIERS: "Courier"
+};
+
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('Index')
+      .setTitle('Order Management Pro')
+      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+      .addMetaTag('viewport', 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0');
+}
+
+// --- Standard Response Helper ---
+function createResponse(success, data = null, message = "") {
+  return { success, data, message };
+}
+
+// --- API: Get Master Data ---
+function getInitData() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const getList = (sheetName, col) => {
+      const sheet = ss.getSheetByName(sheetName);
+      if (!sheet) return [];
+      const lastRow = sheet.getLastRow();
+      if (lastRow < 2) return [];
+      return sheet.getRange(`${col}2:${col}${lastRow}`).getValues()
+        .flat()
+        .filter(item => item && item.toString().trim() !== "");
+    };
+    return createResponse(true, {
+      products: getList(CONFIG.SHEET_PRODUCTS, "B"),
+      couriers: getList(CONFIG.SHEET_COURIERS, "A")
+    });
+  } catch (e) {
+    return createResponse(false, null, e.message);
+  }
+}
+
+// --- Utility: Formats ---
+function formatDateThai(dateStr) {
+  if (!dateStr) return "";
+  
+  // Clean clean
+  dateStr = dateStr.trim().replace(/'/g, '');
+
+  // Case 1: Already DD/MM/YYYY (e.g., 30/01/2026) -> Keep it
+  if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(dateStr)) {
+      return `'${dateStr}`;
+  }
+
+  // Case 2: Input is YYYY-MM-DD (e.g., 2026-01-30) -> Convert to DD/MM/YYYY
+  const isoParts = dateStr.split('-');
+  if (isoParts.length === 3) {
+      if (isoParts[0].length === 4) {
+          // YYYY-MM-DD -> DD/MM/YYYY
+           return `'${isoParts[2]}/${isoParts[1]}/${isoParts[0]}`;
+      } else if (isoParts[2].length === 4) {
+          // DD-MM-YYYY -> DD/MM/YYYY (Just replace separator)
+           return `'${isoParts[0]}/${isoParts[1]}/${isoParts[2]}`;
+      }
+  }
+
+  return "'" + dateStr;
+}
+
+function formatPhoneForSheet(p) {
+  let str = (p || "").toString().trim().replace(/-|\s/g, "");
+  if (str === "") return "";
+  if (str.startsWith("66")) str = "0" + str.substring(2);
+  return "'" + str; 
+}
+
+// --- Utility: Clean Thai Text Artifacts ---
+function cleanThaiText(text) {
+  if (!text || typeof text !== 'string') return text;
+
+  // 1. Normalize Unicode (NFKC) - fixes compatibility chars
+  let clean = text.normalize('NFKC');
+
+  // 2. Remove Zero-width spaces & control chars
+  clean = clean.replace(/[\u200B-\u200D\uFEFF]/g, '');
+
+  // 3. Fix "Sara Am" decomposition (Nikhahit + Sara Aa -> Sara Am)
+  clean = clean.replace(/\u0E4D\u0E32/g, '\u0E33');
+
+  // 4. Fix Thai PUA (Private Use Area) artifacts often found in PDFs
+  clean = clean.replace(/[\uF700-\uF71F]/g, (c) => {
+      const code = c.charCodeAt(0);
+      if (code === 0xF70A) return '\u0E48'; // Mai Ek
+      if (code === 0xF70B) return '\u0E49'; // Mai Tho
+      if (code === 0xF70C) return '\u0E4A'; // Mai Tri
+      if (code === 0xF70D) return '\u0E4B'; // Mai Chattawa
+      if (code === 0xF70E) return '\u0E4C'; // Thanthakhat
+      return ''; 
+  });
+
+  return clean.trim();
+}
+
+// --- API: Save Data ---
+function saveData(data) {
+  return saveBatchData({ orders: [data] });
+}
+
+// --- API: Save Batch Data ---
+function saveBatchData(payload) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) return createResponse(false, null, "ระบบกำลังยุ่ง กรุณาลองใหม่");
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sheet = ss.getSheetByName(CONFIG.SHEET_ORDERS);
+    if (!sheet) {
+        sheet = ss.insertSheet(CONFIG.SHEET_ORDERS);
+        sheet.appendRow(["Date", "Order No", "Set", "Page", "Recipient", "Address", "Phone", "Product", "Qty", "Courier"]);
+    }
+    
+    const allRows = [];
+    payload.orders.forEach(data => {
+      const phone = formatPhoneForSheet(data.phone);
+      const dateStr = formatDateThai(data.date);
+      data.items.forEach(item => {
+        allRows.push([
+          dateStr, data.order_no.toString(), data.set_name, data.page_no,
+          data.recipient_name, data.address, phone, item.name, item.qty, data.courier
+        ]);
+      });
+    });
+
+    if (allRows.length > 0) {
+      sheet.getRange(sheet.getLastRow() + 1, 1, allRows.length, allRows[0].length).setValues(allRows);
+    }
+    return createResponse(true, null, `บันทึกสำเร็จ ${payload.orders.length} ออเดอร์`);
+  } catch (e) {
+    return createResponse(false, null, "Error: " + e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// --- API: Update Order ---
+function updateOrder(oldNo, newData) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return createResponse(false, null, "ระบบกำลังยุ่ง");
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(CONFIG.SHEET_ORDERS);
+    const dataRange = sheet.getDataRange();
+    const values = dataRange.getValues(); 
+    
+    const rowsToDelete = [];
+    for (let i = values.length - 1; i >= 1; i--) { 
+      if (values[i][1].toString() === oldNo.toString()) rowsToDelete.push(i + 1);
+    }
+
+    if (rowsToDelete.length === 0) return createResponse(false, null, "ไม่พบข้อมูลเดิม");
+
+    rowsToDelete.forEach(rowIndex => sheet.deleteRow(rowIndex));
+
+    const phone = formatPhoneForSheet(newData.phone);
+    const dateStr = formatDateThai(newData.date);
+    const newRows = newData.items.map(item => [
+      dateStr, newData.order_no.toString(), newData.set_name, newData.page_no,
+      newData.recipient_name, newData.address, phone, item.name, item.qty, newData.courier
+    ]);
+
+    const insertPos = rowsToDelete[rowsToDelete.length - 1]; 
+    if (newRows.length > 0) {
+      sheet.insertRowsBefore(insertPos, newRows.length);
+      sheet.getRange(insertPos, 1, newRows.length, newRows[0].length).setValues(newRows);
+    }
+    return createResponse(true, null, "แก้ไขข้อมูลเรียบร้อย");
+  } catch (e) {
+    return createResponse(false, null, "Error: " + e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// --- API: Delete Order ---
+function deleteOrder(no) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return createResponse(false, null, "ระบบยุ่ง");
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(CONFIG.SHEET_ORDERS);
+    const data = sheet.getDataRange().getValues();
+    let deletedCount = 0;
+    for (let i = data.length - 1; i >= 1; i--) {
+      if (data[i][1].toString() === no.toString()) { 
+        sheet.deleteRow(i + 1); deletedCount++;
+      }
+    }
+    if (deletedCount === 0) return createResponse(false, null, "ไม่พบข้อมูล");
+    return createResponse(true, null, `ลบข้อมูลเรียบร้อย (${deletedCount} รายการ)`);
+  } catch (e) {
+    return createResponse(false, null, "Error: " + e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// --- API: Get Orders Data ---
+function getOrderData() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(CONFIG.SHEET_ORDERS);
+    if (!sheet) return createResponse(true, []);
+    const rows = sheet.getDataRange().getDisplayValues(); 
+    if (rows.length <= 1) return createResponse(true, []);
+
+    const grouped = {};
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i];
+      if (r.length < 2) continue;
+      const id = r[1];
+      if (!id) continue;
+      if (!grouped[id]) {
+        grouped[id] = { date: r[0], no: id, set: r[2], pg: r[3], nm: r[4], ad: r[5], tel: r[6], items: [], cur: r[9] };
+      }
+      if (r[7]) grouped[id].items.push({ name: r[7], qty: r[8] });
+    }
+    return createResponse(true, Object.values(grouped).reverse());
+  } catch (e) {
+    return createResponse(false, [], e.message);
+  }
+}
+
+// --- API: Process PDF with Standard Logic (Revised Regex) ---
+function processWithStandard(pdfPages) {
+  if (!pdfPages || pdfPages.length === 0) return createResponse(false, null, "ไม่มีข้อมูล PDF");
+
+  const results = [];
+
+  try {
+    pdfPages.forEach(p => {
+      const text = p.text;
+      
+      // 1. Page Number
+      const pageNo = p.pageIndex;
+
+      // 2. Order No (Find "Shopee Order No.")
+      let orderNo = "";
+      const orderMatch = text.match(/Shopee Order No\.?\s*([A-Z0-9]+)/i);
+      if (orderMatch) orderNo = orderMatch[1];
+
+      // 3. Date (Find Pattern DD-MM-YYYY)
+      // FIX: Don't rely on "PICKUP DATE" label proximity. Look for the date format directly.
+      let date = "";
+      // Regex matches 28-01-2026 or 28/01/2026
+      const datePattern = text.match(/(\d{1,2})[-/](\d{1,2})[-/](\d{4})/);
+      if (datePattern) {
+          // Convert to YYYY-MM-DD to match AI format expected by frontend
+          date = `${datePattern[3]}-${datePattern[2]}-${datePattern[1]}`;
+      }
+
+      // 4. Phone
+      let phone = "";
+      // FIX: Look for 66xxxxxxxxx or 0xxxxxxxxx globally
+      // Matches: 66956426261 or 0956426261
+      const phoneCandidates = text.match(/(?:66|0)\d{1}[-\s]*\d{3}[-\s]*\d{4,5}/g);
+      if (phoneCandidates) {
+         // Pick the first valid-looking mobile number
+         const cleanCandidates = phoneCandidates.map(ph => ph.replace(/\D/g, ''));
+         const bestPhone = cleanCandidates.find(ph => ph.length >= 9 && (ph.startsWith('66') || ph.startsWith('06') || ph.startsWith('08') || ph.startsWith('09')));
+         
+         if (bestPhone) {
+             phone = bestPhone;
+             if (phone.startsWith('66')) phone = '0' + phone.substring(2);
+         }
+      }
+
+      // 5. Recipient Name & Address
+      let recipientName = "";
+      let address = "";
+
+      const toMarker = "ผู้รับ (TO)";
+      const toIndex = text.indexOf(toMarker);
+
+      if (toIndex !== -1) {
+          // Identify the end of the recipient block
+          let endIndices = [
+              text.indexOf("Shopee Order No", toIndex),
+              text.indexOf("Phone", toIndex),
+              text.indexOf("PICKUP DATE", toIndex),
+              text.indexOf("SHIP BY DATE", toIndex)
+          ].filter(i => i !== -1);
+
+          const endIndex = endIndices.length > 0 ? Math.min(...endIndices) : text.length;
+          
+          let recipientBlock = text.substring(toIndex + toMarker.length, endIndex).trim();
+
+          // Clean phone from this block if present
+          if (phone) {
+             recipientBlock = recipientBlock.replace(new RegExp(phone.replace(/^0/, '66'), 'g'), ''); // Remove 66 version
+             recipientBlock = recipientBlock.replace(new RegExp(phone, 'g'), ''); // Remove 0 version
+          }
+
+          // Simple Split: Name is usually the first line or until we see address keywords
+          const addressMarker = recipientBlock.match(/(?:เลขที่|หมู่|ซอย|ถนน|ต\.|อ\.|จ\.|ตำบล|อำเภอ|จังหวัด|\d+\/)/);
+          if (addressMarker) {
+              const splitIdx = addressMarker.index;
+              recipientName = recipientBlock.substring(0, splitIdx).trim();
+              address = recipientBlock.substring(splitIdx).trim();
+          } else {
+              recipientName = ""; 
+              address = recipientBlock;
+          }
+      }
+
+      // Cleanup
+      recipientName = cleanThaiText(recipientName);
+      address = cleanThaiText(address);
+
+      results.push({
+          page_no: pageNo,
+          date: date,
+          order_no: orderNo,
+          recipient_name: recipientName,
+          address: address,
+          phone: phone,
+          items: [{name: "", qty: 1}] // Default item
+      });
+    });
+
+    return createResponse(true, results, "Success (Standard Mode)");
+
+  } catch (error) {
+    return createResponse(false, null, "Standard Error: " + error.message);
+  }
+}
+
+// --- API: Process PDF Text with Gemini (AI) ---
+function processWithAI(pdfPages, apiKey) {
+  if (!apiKey) return createResponse(false, null, "ไม่พบ API Key");
+  if (!pdfPages || pdfPages.length === 0) return createResponse(false, null, "ไม่มีข้อมูล PDF");
+
+  const combinedText = pdfPages.map(p => `--- PAGE ${p.pageIndex} ---\n${p.text}`).join("\n\n");
+
+  // IMPROVED PROMPT: Specially targeted at NAME extraction
+  const prompt = `
+    Task: Extract **RECIPIENT (ผู้รับ)** shipping details from Thai shipping labels into JSON.
+    
+    **CRITICAL EXTRACTION LOGIC:**
+    1. **FIND MARKER**: Find the keyword "ผู้รับ (TO)".
+    2. **EXTRACT NAME**: The **recipient_name** is the text IMMEDIATELY following "ผู้รับ (TO)" on the **same line** (or the very next line if empty).
+       - Example A: "ผู้รับ (TO) สมชาย ใจดี 0812345678" -> Name is "สมชาย ใจดี"
+       - Example B: "ผู้รับ (TO)\nสมหญิง รักดี" -> Name is "สมหญิง รักดี"
+    3. **EXTRACT ADDRESS**: The text following the name is the address.
+    4. **IGNORE SENDER**: Do NOT extract anything labeled "ผู้ส่ง" or "FROM".
+    5. **CLEANUP**: Do not include the text "ผู้รับ (TO)" in the name field.
+
+    **ONE-SHOT EXAMPLE:**
+    Input:
+    "--- PAGE 1 ---
+     ผู้ส่ง (FROM) Shop A ...
+     ผู้รับ (TO) คุณสมหญิง รักดี 081-111-2222
+     123/4 หมู่ 5 ต.บ้านใหม่ อ.เมือง จ.เชียงใหม่ 50000
+     Shopee Order No. 123456
+     PICKUP DATE 30-01-2026"
+    
+    Output:
+    [{
+      "page_no": 1,
+      "date": "2026-01-30",
+      "order_no": "123456",
+      "recipient_name": "คุณสมหญิง รักดี",
+      "address": "123/4 หมู่ 5 ต.บ้านใหม่ อ.เมือง จ.เชียงใหม่ 50000",
+      "phone": "0811112222",
+      "items": [{"name": "", "qty": 1}]
+    }]
+
+    Raw Text:
+    ${combinedText}
+  `;
+
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+    const payload = { contents: [{ parts: [{ text: prompt }] }] };
+    
+    const options = {
+      'method': 'post',
+      'contentType': 'application/json',
+      'payload': JSON.stringify(payload),
+      'muteHttpExceptions': true
+    };
+
+    const response = UrlFetchApp.fetch(url, options);
+    const json = JSON.parse(response.getContentText());
+    
+    if (json.error) throw new Error(json.error.message);
+    if (!json.candidates || !json.candidates[0]) throw new Error("No AI response");
+
+    let rawResult = json.candidates[0].content.parts[0].text;
+    rawResult = rawResult.replace(/```json/g, '').replace(/```/g, '').trim();
+    
+    const jsonMatch = rawResult.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) throw new Error("Invalid JSON format");
+    
+    let parsedData = JSON.parse(jsonMatch[0]);
+
+    // Post-processing
+    parsedData = parsedData.map(d => {
+       const markerRegex = /(?:--- PAGE \s*\d+\s*---|\[Image \s*\d+\s*\])/gi;
+
+       if (d.recipient_name) {
+           // 1. Remove Page Markers
+           d.recipient_name = d.recipient_name.replace(markerRegex, '').trim();
+           // 2. Remove "ผู้รับ (TO)" if AI included it
+           d.recipient_name = d.recipient_name.replace(/ผู้รับ\s*\(TO\)/i, '').trim();
+       }
+       
+       if (d.address) {
+           d.address = d.address.replace(markerRegex, '').trim();
+           
+           // Safety Check: If "ผู้ส่ง" or "FROM" accidentally got into the address, strip it.
+           if (d.address.includes("ผู้ส่ง (FROM)") || d.address.includes("Health D")) {
+               d.address = d.address.replace(/ผู้ส่ง \(FROM\).*?(\d{5})?/g, "").trim(); 
+           }
+           if (d.address.includes("216/7")) {
+              d.address = d.address.replace(/.*?216\/7.*?\d{5}/, "").trim();
+           }
+       }
+
+       if (d.recipient_name) d.recipient_name = cleanThaiText(d.recipient_name);
+       if (d.address) d.address = cleanThaiText(d.address);
+       
+       if (d.phone) {
+           let p = d.phone.toString().replace(/\D/g, ''); 
+           if (p.startsWith('66')) p = '0' + p.substring(2);
+           d.phone = p;
+       }
+
+       d.items = [{"name": "", "qty": 1}];
+       return d;
+    });
+
+    return createResponse(true, parsedData, "Success");
+
+  } catch (error) {
+    return createResponse(false, null, "AI Error: " + error.message);
+  }
+}
